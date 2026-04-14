@@ -1,8 +1,8 @@
-# DesktopPetForLinux
+# DesktopGirlForLinux
 
-把**任意视频**变成透明桌面宠物，悬浮在 Linux 桌面最上层播放。
+把**任意视频中的人物**变成透明桌面对象，悬浮在 Linux 桌面最上层播放。
 
-Turn **any video** into a transparent desktop pet that floats on top of your Linux desktop.
+Turn **people in any video** into transparent desktop objects, floating and playing on top of the Linux desktop.
 
 > 与同类项目的核心区别：**无需绿幕、无需透明素材**。内置 AI 语义分割（U2Net）预处理步骤，自动从普通视频中抠出前景，任何一段人物/角色视频都可以直接用。
 
