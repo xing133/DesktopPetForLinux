@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import re
 import shutil
 import subprocess
@@ -52,138 +51,50 @@ class _SegmentWorker(QThread):
         video_path: Path,
         dancer_dir: Path,
         display_height: int = 450,
-        model_name: str = "u2net_human_seg",
+        rvm_variant: str = "mobilenetv3",
+        device: str = "auto",
     ):
         super().__init__()
         self._video_path = video_path
         self._dancer_dir = dancer_dir
         self._display_height = display_height
-        self._model_name = model_name
+        self._rvm_variant = rvm_variant
+        self._device = device
         self._cancelled = False
 
     def cancel(self) -> None:
         self._cancelled = True
 
     def run(self) -> None:
+        from src.rvm_matting import MattingCancelled
+
         try:
             self._do_segment()
+        except MattingCancelled:
+            self._cleanup_output_dir()
+            self.finished_err.emit("已取消")
         except Exception as e:
-            # 清理不完整的输出目录
-            if self._dancer_dir.exists():
-                shutil.rmtree(str(self._dancer_dir), ignore_errors=True)
+            self._cleanup_output_dir()
             self.finished_err.emit(str(e))
 
+    def _cleanup_output_dir(self) -> None:
+        if self._dancer_dir.exists():
+            shutil.rmtree(str(self._dancer_dir), ignore_errors=True)
+
     def _do_segment(self) -> None:
-        from fractions import Fraction
+        from src.rvm_matting import run_matting
 
-        # ------------------------------------------------------------------
-        # 1. 探测视频元数据
-        # ------------------------------------------------------------------
-        self.stage_changed.emit("正在读取视频信息…")
-        out = subprocess.check_output([
-            "ffprobe", "-v", "quiet", "-print_format", "json",
-            "-show_streams", str(self._video_path),
-        ])
-        data = json.loads(out)
-        vs = next(s for s in data["streams"] if s["codec_type"] == "video")
-        fps = float(Fraction(vs["r_frame_rate"]))
-        n_frames = int(vs.get("nb_frames") or round(float(vs["duration"]) * fps))
-        w, h = int(vs["width"]), int(vs["height"])
-
-        display_h = self._display_height
-        display_w = int(round(w / h * display_h))
-
-        # ------------------------------------------------------------------
-        # 2. 加载模型
-        # ------------------------------------------------------------------
-        self.stage_changed.emit(
-            f"正在加载模型 {self._model_name}（首次运行会下载约 176MB）…"
+        run_matting(
+            input_path=self._video_path,
+            frames_dir=self._dancer_dir,
+            variant=self._rvm_variant,
+            device=self._device,
+            display_height=self._display_height,
+            overwrite=True,
+            progress_callback=self.progress.emit,
+            stage_callback=self.stage_changed.emit,
+            cancel_requested=lambda: self._cancelled,
         )
-        from backgroundremover.bg import naive_cutout
-        from backgroundremover.u2net import detect
-
-        # 检测 CUDA，失败自动回退 CPU
-        try:
-            import torch
-            if torch.cuda.is_available():
-                self.stage_changed.emit(
-                    f"检测到 CUDA，使用 GPU 加速…"
-                )
-        except ImportError:
-            pass
-
-        net = detect.load_model(model_name=self._model_name)
-
-        if self._cancelled:
-            self.finished_err.emit("已取消")
-            return
-
-        # ------------------------------------------------------------------
-        # 3. 逐帧处理
-        # ------------------------------------------------------------------
-        self._dancer_dir.mkdir(parents=True, exist_ok=True)
-        self.stage_changed.emit(f"正在处理 {n_frames} 帧…")
-
-        frame_bytes = w * h * 3
-        proc = subprocess.Popen(
-            [
-                "ffmpeg", "-loglevel", "error",
-                "-i", str(self._video_path),
-                "-f", "rawvideo", "-pix_fmt", "rgb24", "-",
-            ],
-            stdout=subprocess.PIPE,
-        )
-
-        import numpy as np
-        from PIL import Image
-
-        idx = 0
-        try:
-            while True:
-                if self._cancelled:
-                    proc.kill()
-                    proc.wait()
-                    shutil.rmtree(str(self._dancer_dir), ignore_errors=True)
-                    self.finished_err.emit("已取消")
-                    return
-
-                raw = proc.stdout.read(frame_bytes)
-                if len(raw) < frame_bytes:
-                    break
-
-                idx += 1
-                frame_np = np.frombuffer(raw, dtype=np.uint8).reshape(h, w, 3)
-                out_path = self._dancer_dir / f"frame_{idx:04d}.png"
-
-                pil_img = Image.fromarray(frame_np, "RGB")
-                mask = detect.predict(net, frame_np).convert("L")
-                rgba = naive_cutout(pil_img, mask)
-                rgba_scaled = rgba.resize((display_w, display_h), Image.LANCZOS)
-                rgba_scaled.save(str(out_path), "PNG")
-
-                self.progress.emit(idx, n_frames)
-        finally:
-            proc.stdout.close()
-            proc.wait()
-
-        if idx == 0:
-            raise RuntimeError("未读取到任何视频帧，请检查视频文件")
-
-        # ------------------------------------------------------------------
-        # 4. 写 metadata.json
-        # ------------------------------------------------------------------
-        sample = Image.open(self._dancer_dir / "frame_0001.png")
-        actual_w, actual_h = sample.size
-        meta = {
-            "fps": fps,
-            "frame_count": idx,
-            "width": actual_w,
-            "height": actual_h,
-            "source_video": str(self._video_path),
-            "model": self._model_name,
-        }
-        with open(self._dancer_dir / "metadata.json", "w", encoding="utf-8") as f:
-            json.dump(meta, f, indent=2)
 
         self.finished_ok.emit()
 

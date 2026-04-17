@@ -18,10 +18,9 @@ import argparse
 import json
 import shutil
 import subprocess
-import sys
 from fractions import Fraction
 from pathlib import Path
-from typing import Iterator
+from typing import Callable, Iterator
 
 import numpy as np
 import torch
@@ -29,6 +28,14 @@ from PIL import Image
 from torchvision.transforms.functional import to_tensor
 
 LANCZOS = getattr(Image, "Resampling", Image).LANCZOS
+
+ProgressCallback = Callable[[int, int], None]
+StageCallback = Callable[[str], None]
+CancelCallback = Callable[[], bool]
+
+
+class MattingCancelled(RuntimeError):
+    pass
 
 
 def parse_args() -> argparse.Namespace:
@@ -253,23 +260,32 @@ def save_image(image_tensor: torch.Tensor, output_path: Path) -> None:
     Image.fromarray(image).save(output_path)
 
 
-def main() -> None:
-    args = parse_args()
-    input_path = Path(args.input).expanduser().resolve()
-    frames_dir = Path(args.frames_dir).expanduser().resolve()
-    repo_path = Path(args.rvm_repo).expanduser().resolve() if args.rvm_repo else None
+def run_matting(
+    input_path: str | Path,
+    frames_dir: str | Path,
+    *,
+    variant: str = "mobilenetv3",
+    device: str = "auto",
+    repo_path: str | Path | None = None,
+    checkpoint_path: str | Path | None = None,
+    display_height: int | None = None,
+    downsample_ratio: float | None = None,
+    overwrite: bool = False,
+    alpha_dir: str | Path | None = None,
+    foreground_dir: str | Path | None = None,
+    progress_callback: ProgressCallback | None = None,
+    stage_callback: StageCallback | None = None,
+    cancel_requested: CancelCallback | None = None,
+) -> dict:
+    input_path = Path(input_path).expanduser().resolve()
+    frames_dir = Path(frames_dir).expanduser().resolve()
+    repo_path = Path(repo_path).expanduser().resolve() if repo_path else None
     checkpoint_path = (
-        Path(args.checkpoint).expanduser().resolve() if args.checkpoint else None
+        Path(checkpoint_path).expanduser().resolve() if checkpoint_path else None
     )
-    alpha_dir = (
-        Path(args.save_alpha_dir).expanduser().resolve()
-        if args.save_alpha_dir
-        else None
-    )
+    alpha_dir = Path(alpha_dir).expanduser().resolve() if alpha_dir else None
     foreground_dir = (
-        Path(args.save_foreground_dir).expanduser().resolve()
-        if args.save_foreground_dir
-        else None
+        Path(foreground_dir).expanduser().resolve() if foreground_dir else None
     )
 
     if not input_path.is_file():
@@ -278,43 +294,45 @@ def main() -> None:
         raise SystemExit(f"Local RVM repo not found: {repo_path}")
     if checkpoint_path is not None and not checkpoint_path.is_file():
         raise SystemExit(f"Checkpoint not found: {checkpoint_path}")
-    if args.downsample_ratio is not None and not (0 < args.downsample_ratio <= 1):
+    if downsample_ratio is not None and not (0 < downsample_ratio <= 1):
         raise SystemExit("--downsample-ratio must be in the range (0, 1].")
+
+    def is_cancelled() -> bool:
+        return bool(cancel_requested and cancel_requested())
+
+    if is_cancelled():
+        raise MattingCancelled("Cancelled before start.")
 
     ffmpeg_bin = require_binary("ffmpeg")
     ffprobe_bin = require_binary("ffprobe")
-    ensure_clean_output_dir(frames_dir, overwrite=args.overwrite)
+    ensure_clean_output_dir(frames_dir, overwrite=overwrite)
     if alpha_dir is not None:
         alpha_dir.mkdir(parents=True, exist_ok=True)
     if foreground_dir is not None:
         foreground_dir.mkdir(parents=True, exist_ok=True)
 
+    if stage_callback is not None:
+        stage_callback("正在读取视频信息…")
     fps, frame_count, source_width, source_height = probe_video(
         ffprobe_bin, input_path
     )
     output_width, output_height = compute_output_size(
-        source_width, source_height, args.display_height
+        source_width, source_height, display_height
     )
-    downsample_ratio = args.downsample_ratio or auto_downsample_ratio(
+    actual_downsample_ratio = downsample_ratio or auto_downsample_ratio(
         output_height, output_width
     )
-    device = choose_device(args.device)
+    selected_device = choose_device(device)
 
-    print(f"Input: {input_path}")
-    print(
-        f"Source: {source_width}x{source_height} @ {fps:.3f}fps, "
-        f"{frame_count} frames"
-    )
-    print(
-        f"Output PNG sequence: {output_width}x{output_height}, "
-        f"downsample_ratio={downsample_ratio:.4f}, device={device}"
-    )
-    print("Upstream RVM default output_type is 'video'; this wrapper uses PNG.")
+    if is_cancelled():
+        raise MattingCancelled("Cancelled before model load.")
 
+    if stage_callback is not None:
+        stage_callback(f"正在加载 RVM 模型 {variant}…")
     try:
         model = load_model(
-            variant=args.variant,
-            device=device,
+            variant=variant,
+            device=selected_device,
             repo_path=repo_path,
             checkpoint_path=checkpoint_path,
         )
@@ -327,6 +345,15 @@ def main() -> None:
             hint += " You can also pass --checkpoint /path/to/rvm_*.pth."
         raise SystemExit(f"{hint}\nOriginal error: {exc}") from exc
 
+    if is_cancelled():
+        raise MattingCancelled("Cancelled after model load.")
+
+    if stage_callback is not None:
+        if selected_device == "cuda":
+            stage_callback(f"检测到 CUDA，正在使用 GPU 处理 {frame_count} 帧…")
+        else:
+            stage_callback(f"正在使用 CPU 处理 {frame_count} 帧…")
+
     rec = [None] * 4
     processed = 0
 
@@ -335,15 +362,16 @@ def main() -> None:
             iter_raw_frames(ffmpeg_bin, input_path, source_width, source_height),
             start=1,
         ):
+            if is_cancelled():
+                raise MattingCancelled("Cancelled while processing frames.")
+
             image = Image.fromarray(frame_np)
             if (output_width, output_height) != (source_width, source_height):
                 image = image.resize((output_width, output_height), LANCZOS)
 
-            src = to_tensor(image).unsqueeze(0).unsqueeze(0).to(device)
-            fgr, pha, *rec = model(src, *rec, downsample_ratio)
+            src = to_tensor(image).unsqueeze(0).unsqueeze(0).to(selected_device)
+            fgr, pha, *rec = model(src, *rec, actual_downsample_ratio)
 
-            # Follow the upstream png_sequence path: save RGBA, with RGB masked
-            # by non-zero alpha to reduce edge bleed in premultiplied viewers.
             foreground = (fgr[0, 0] * pha[0, 0].gt(0)).cpu()
             alpha = pha[0, 0].cpu()
             rgba = torch.cat([foreground, alpha], dim=0)
@@ -363,8 +391,8 @@ def main() -> None:
                 )
 
             processed = index
-            if processed % 10 == 0 or processed == frame_count:
-                print(f"  [{processed:4d}/{frame_count}] {processed / frame_count * 100:5.1f}%")
+            if progress_callback is not None:
+                progress_callback(processed, frame_count)
 
     if processed == 0:
         raise SystemExit("No frames were decoded from the input video.")
@@ -376,19 +404,58 @@ def main() -> None:
         "height": output_height,
         "source_video": str(input_path),
         "matting_backend": "RobustVideoMatting",
-        "rvm_variant": args.variant,
-        "rvm_checkpoint": str(checkpoint_path) if checkpoint_path else "torch.hub pretrained",
+        "rvm_variant": variant,
+        "rvm_checkpoint": (
+            str(checkpoint_path) if checkpoint_path else "torch.hub pretrained"
+        ),
         "rvm_official_default_output_type": "video",
         "output_type": "png_sequence",
-        "device": device,
-        "downsample_ratio": downsample_ratio,
+        "device": selected_device,
+        "downsample_ratio": actual_downsample_ratio,
     }
     metadata_path = frames_dir / "metadata.json"
     with metadata_path.open("w", encoding="utf-8") as file:
         json.dump(metadata, file, indent=2, ensure_ascii=False)
 
-    print(f"Done. Wrote {processed} RGBA PNG frames to {frames_dir}")
-    print(f"Metadata: {metadata_path}")
+    return metadata
+
+
+def main() -> None:
+    args = parse_args()
+    input_path = Path(args.input).expanduser().resolve()
+    frames_dir = Path(args.frames_dir).expanduser().resolve()
+
+    print(f"Input: {input_path}")
+    print("Upstream RVM default output_type is 'video'; this wrapper uses PNG.")
+
+    def on_progress(processed: int, total: int) -> None:
+        if processed % 10 == 0 or processed == total:
+            print(
+                f"  [{processed:4d}/{total}] {processed / total * 100:5.1f}%"
+            )
+
+    metadata = run_matting(
+        input_path=input_path,
+        frames_dir=frames_dir,
+        variant=args.variant,
+        device=args.device,
+        repo_path=args.rvm_repo,
+        checkpoint_path=args.checkpoint,
+        display_height=args.display_height,
+        downsample_ratio=args.downsample_ratio,
+        overwrite=args.overwrite,
+        alpha_dir=args.save_alpha_dir,
+        foreground_dir=args.save_foreground_dir,
+        progress_callback=on_progress,
+    )
+
+    print(
+        f"Output PNG sequence: {metadata['width']}x{metadata['height']}, "
+        f"downsample_ratio={metadata['downsample_ratio']:.4f}, "
+        f"device={metadata['device']}"
+    )
+    print(f"Done. Wrote {metadata['frame_count']} RGBA PNG frames to {frames_dir}")
+    print(f"Metadata: {frames_dir / 'metadata.json'}")
 
 
 if __name__ == "__main__":
