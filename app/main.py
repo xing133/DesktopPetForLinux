@@ -1,11 +1,11 @@
 from __future__ import annotations
 
 import sys
-from pathlib import Path
 
 from PySide6.QtWidgets import QApplication
 
 from app.core.player_bridge import PlayerBridge
+from app.runtime_paths import get_runtime_root
 from app.ui.add_wife_wizard import AddWifeWizard
 from app.ui.tray import DesktopDancerTray
 
@@ -22,7 +22,7 @@ def run() -> int:
     app = QApplication(sys.argv)
     app.setQuitOnLastWindowClosed(False)
 
-    project_root = Path(__file__).resolve().parents[1]
+    project_root = get_runtime_root()
     player_bridge = PlayerBridge(project_root=project_root)
 
     def on_dancer_ready(name: str) -> None:

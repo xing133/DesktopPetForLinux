@@ -27,6 +27,8 @@ import torch
 from PIL import Image
 from torchvision.transforms.functional import to_tensor
 
+from app.runtime_paths import find_tool_binary
+
 LANCZOS = getattr(Image, "Resampling", Image).LANCZOS
 
 ProgressCallback = Callable[[int, int], None]
@@ -113,11 +115,10 @@ def parse_args() -> argparse.Namespace:
 
 
 def require_binary(name: str) -> str:
-    binary = shutil.which(name)
+    binary = find_tool_binary(name)
     if binary is None:
         raise SystemExit(
-            f"Missing required binary '{name}'. Install ffmpeg/ffprobe and keep "
-            "them on PATH."
+            f"Missing required binary '{name}'. Put it in tools/ or keep it on PATH."
         )
     return binary
 

@@ -3,6 +3,7 @@ from __future__ import annotations
 import re
 import shutil
 import subprocess
+import sys
 from enum import Enum
 from pathlib import Path
 from typing import Callable
@@ -11,6 +12,7 @@ from PySide6.QtCore import QProcess, Qt, QThread, QUrl, Signal
 from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
 from PySide6.QtMultimediaWidgets import QVideoWidget
 from PySide6.QtWidgets import (
+    QComboBox,
     QFileDialog,
     QHBoxLayout,
     QLabel,
@@ -22,6 +24,14 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
+
+from app.matting import (
+    SegmentJobRequest,
+    create_segment_worker,
+    get_engine_spec,
+    get_engines_for_current_platform,
+)
+from app.runtime_paths import find_tool_binary, get_runtime_root
 
 
 class ImportState(str, Enum):
@@ -115,7 +125,7 @@ class AddWifeWizard(QWidget):
 
         self._on_dancer_ready = on_dancer_ready
 
-        self._project_root = Path(__file__).resolve().parents[2]
+        self._project_root = get_runtime_root()
         self._workspace_dir = self._project_root / "workspace"
         self._raw_dir = self._workspace_dir / "raw"
         self._mp4_dir = self._workspace_dir / "mp4"
@@ -123,12 +133,23 @@ class AddWifeWizard(QWidget):
         self._raw_dir.mkdir(parents=True, exist_ok=True)
         self._mp4_dir.mkdir(parents=True, exist_ok=True)
 
+        self._is_windows = sys.platform.startswith("win")
+        self._matting_engines = get_engines_for_current_platform(self._project_root)
+        self._selected_matting_engine_id = next(
+            (
+                spec.engine_id
+                for spec in self._matting_engines
+                if spec.available
+            ),
+            self._matting_engines[0].engine_id if self._matting_engines else "",
+        )
+
         self._state = ImportState.IMPORT_SOURCE
         self._job_id: str | None = None
         self._pending_input_video: Path | None = None
         self._preview_video: Path | None = None
         self._dancer_name: str = ""
-        self._segment_worker: _SegmentWorker | None = None
+        self._segment_worker = None
 
         self._download_proc: QProcess | None = None
         self._transcode_proc: QProcess | None = None
@@ -305,6 +326,18 @@ class AddWifeWizard(QWidget):
         self._name_edit.setMinimumHeight(36)
         self._name_edit.textChanged.connect(self._on_naming_input_changed)
 
+        self._engine_combo = QComboBox()
+        self._engine_combo.setMinimumHeight(36)
+        for spec in self._matting_engines:
+            self._engine_combo.addItem(spec.label, spec.engine_id)
+        selected_index = self._engine_combo.findData(self._selected_matting_engine_id)
+        if selected_index >= 0:
+            self._engine_combo.setCurrentIndex(selected_index)
+        self._engine_combo.currentIndexChanged.connect(self._on_engine_changed)
+
+        self._engine_hint_label = QLabel("")
+        self._engine_hint_label.setWordWrap(True)
+
         self._name_error_label = QLabel("")
         self._name_error_label.setStyleSheet("color: red;")
 
@@ -325,10 +358,15 @@ class AddWifeWizard(QWidget):
         layout.addWidget(hint)
         layout.addSpacing(12)
         layout.addWidget(self._name_edit)
+        if self._is_windows:
+            layout.addWidget(QLabel("抠图引擎"))
+            layout.addWidget(self._engine_combo)
+            layout.addWidget(self._engine_hint_label)
         layout.addWidget(self._name_error_label)
         layout.addSpacing(8)
         layout.addLayout(btn_row)
         layout.addStretch(1)
+        self._update_engine_hint()
         return page
 
     def _build_done_page(self) -> QWidget:
@@ -412,6 +450,29 @@ class AddWifeWizard(QWidget):
             return f'已存在名为"{name}"的角色'
         return None
 
+    def _current_engine_id(self) -> str:
+        if self._is_windows:
+            return str(self._engine_combo.currentData() or self._selected_matting_engine_id)
+        return self._selected_matting_engine_id
+
+    def _update_engine_hint(self) -> None:
+        if not self._is_windows:
+            return
+
+        spec = get_engine_spec(self._current_engine_id(), self._project_root)
+        if spec is None:
+            self._engine_hint_label.setText("未找到当前抠图引擎。")
+            return
+
+        message = spec.description
+        if not spec.available and spec.unavailable_reason:
+            message = f"{message}\n不可用：{spec.unavailable_reason}"
+        self._engine_hint_label.setText(message)
+
+    def _on_engine_changed(self, _index: int) -> None:
+        self._selected_matting_engine_id = self._current_engine_id()
+        self._update_engine_hint()
+
     # ------------------------------------------------------------------
     # 导入来源
     # ------------------------------------------------------------------
@@ -469,7 +530,11 @@ class AddWifeWizard(QWidget):
         ]
 
         self._download_proc = QProcess(self)
-        self._download_proc.setProgram("yt-dlp")
+        yt_dlp_bin = find_tool_binary("yt-dlp")
+        if yt_dlp_bin is None:
+            self._mark_failed("未找到 yt-dlp，可执行文件请放到 tools/ 目录或加入 PATH")
+            return
+        self._download_proc.setProgram(yt_dlp_bin)
         self._download_proc.setArguments(args)
         self._download_proc.setProcessChannelMode(QProcess.ProcessChannelMode.MergedChannels)
         self._download_proc.readyReadStandardOutput.connect(self._on_download_output)
@@ -513,8 +578,11 @@ class AddWifeWizard(QWidget):
     # ------------------------------------------------------------------
 
     def _probe_duration_sec(self, video_path: Path) -> float:
+        ffprobe_bin = find_tool_binary("ffprobe")
+        if ffprobe_bin is None:
+            raise RuntimeError("未找到 ffprobe，可执行文件请放到 tools/ 目录或加入 PATH")
         cmd = [
-            "ffprobe",
+            ffprobe_bin,
             "-v", "error",
             "-show_entries", "format=duration",
             "-of", "default=noprint_wrappers=1:nokey=1",
@@ -550,7 +618,11 @@ class AddWifeWizard(QWidget):
         ]
 
         self._transcode_proc = QProcess(self)
-        self._transcode_proc.setProgram("ffmpeg")
+        ffmpeg_bin = find_tool_binary("ffmpeg")
+        if ffmpeg_bin is None:
+            self._mark_failed("未找到 ffmpeg，可执行文件请放到 tools/ 目录或加入 PATH")
+            return
+        self._transcode_proc.setProgram(ffmpeg_bin)
         self._transcode_proc.setArguments(args)
         self._transcode_proc.setProcessChannelMode(QProcess.ProcessChannelMode.MergedChannels)
         self._transcode_proc.readyReadStandardOutput.connect(self._on_transcode_output)
@@ -670,7 +742,19 @@ class AddWifeWizard(QWidget):
         self._cancel_btn.setVisible(True)
         self._back_source_btn.setVisible(False)
 
-        self._segment_worker = _SegmentWorker(video_path, dancer_dir)
+        engine_id = self._current_engine_id()
+        request = SegmentJobRequest(
+            project_root=self._project_root,
+            video_path=video_path,
+            dancer_dir=dancer_dir,
+            display_height=450,
+        )
+        try:
+            self._segment_worker = create_segment_worker(engine_id, request)
+        except Exception as exc:
+            self._mark_failed(f"抠图引擎启动失败：{exc}")
+            return
+
         self._segment_worker.progress.connect(self._on_segment_progress)
         self._segment_worker.stage_changed.connect(self._on_segment_stage)
         self._segment_worker.finished_ok.connect(self._on_segment_done)

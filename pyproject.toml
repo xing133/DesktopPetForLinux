@@ -5,9 +5,13 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
-    "backgroundremover",
-    "torch",
-    "torchvision",
+    "backgroundremover; sys_platform == 'linux'",
+    "numpy",
+    "nuitka",
+    "onnxruntime-directml; sys_platform == 'win32'",
+    "Pillow",
+    "torch; sys_platform == 'linux'",
+    "torchvision; sys_platform == 'linux'",
     "PyGObject<3.50; sys_platform == 'linux'",
     "pycairo; sys_platform == 'linux'",
     "PySide6",
@@ -19,5 +23,5 @@ url = "https://download.pytorch.org/whl/cu128"
 explicit = true
 
 [tool.uv.sources]
-torch = { index = "pytorch-cuda" }
-torchvision = { index = "pytorch-cuda" }
+torch = { index = "pytorch-cuda", marker = "sys_platform == 'linux'" }
+torchvision = { index = "pytorch-cuda", marker = "sys_platform == 'linux'" }

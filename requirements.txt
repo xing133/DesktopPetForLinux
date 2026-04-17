@@ -1,4 +1,10 @@
-backgroundremover
-PyGObject<3.50
-pycairo
+backgroundremover; sys_platform == "linux"
+numpy
+nuitka
+onnxruntime-directml; sys_platform == "win32"
+Pillow
+PyGObject<3.50; sys_platform == "linux"
+pycairo; sys_platform == "linux"
 PySide6
+torch; sys_platform == "linux"
+torchvision; sys_platform == "linux"
