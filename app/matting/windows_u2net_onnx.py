@@ -129,6 +129,8 @@ class WindowsU2netOnnxWorker(QThread):
                 self._request.video_path,
                 source_width,
                 source_height,
+                output_width=output_width,
+                output_height=output_height,
             ),
             start=1,
         ):
@@ -139,13 +141,10 @@ class WindowsU2netOnnxWorker(QThread):
             alpha_mask = self._predict_mask(session, rgb_image)
             rgba_image = rgb_image.copy()
             rgba_image.putalpha(alpha_mask)
-            rgba_image = rgba_image.resize(
-                (output_width, output_height),
-                Image.Resampling.LANCZOS,
-            )
             rgba_image.save(
                 self._request.dancer_dir / f"frame_{index:04d}.png",
                 "PNG",
+                compress_level=1,
             )
 
             processed = index

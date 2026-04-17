@@ -18,6 +18,7 @@ import argparse
 import json
 import shutil
 import subprocess
+import sys
 from fractions import Fraction
 from pathlib import Path
 from typing import Callable, Iterator
@@ -155,22 +156,34 @@ def iter_raw_frames(
     video_path: Path,
     width: int,
     height: int,
+    output_width: int | None = None,
+    output_height: int | None = None,
 ) -> Iterator[np.ndarray]:
-    frame_bytes = width * height * 3
-    proc = subprocess.Popen(
+    decoded_width = output_width or width
+    decoded_height = output_height or height
+    frame_bytes = decoded_width * decoded_height * 3
+    ffmpeg_args = [
+        ffmpeg_bin,
+        "-loglevel",
+        "error",
+        "-i",
+        str(video_path),
+    ]
+    if output_width is not None and output_height is not None:
+        ffmpeg_args.extend(["-vf", f"scale={decoded_width}:{decoded_height}"])
+    ffmpeg_args.extend(
         [
-            ffmpeg_bin,
-            "-loglevel",
-            "error",
-            "-i",
-            str(video_path),
             "-f",
             "rawvideo",
             "-pix_fmt",
             "rgb24",
             "-",
-        ],
+        ]
+    )
+    proc = subprocess.Popen(
+        ffmpeg_args,
         stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
     )
     try:
         if proc.stdout is None:
@@ -180,12 +193,24 @@ def iter_raw_frames(
             raw = proc.stdout.read(frame_bytes)
             if len(raw) < frame_bytes:
                 break
-            yield np.frombuffer(raw, dtype=np.uint8).reshape(height, width, 3)
+            yield np.frombuffer(raw, dtype=np.uint8).reshape(
+                decoded_height, decoded_width, 3
+            )
     finally:
+        active_exception = sys.exc_info()[0] is not None
         if proc.stdout is not None:
             proc.stdout.close()
+        stderr_output = b""
+        if proc.stderr is not None:
+            stderr_output = proc.stderr.read()
+            proc.stderr.close()
         proc.wait()
-        if proc.returncode not in (0, None):
+        if proc.returncode not in (0, None) and not active_exception:
+            stderr_text = stderr_output.decode("utf-8", errors="replace").strip()
+            if stderr_text:
+                raise RuntimeError(
+                    f"ffmpeg exited with code {proc.returncode}: {stderr_text}"
+                )
             raise RuntimeError(f"ffmpeg exited with code {proc.returncode}")
 
 

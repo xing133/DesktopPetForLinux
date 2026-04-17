@@ -13,6 +13,14 @@ from .model_paths import get_rvm_model_path
 from .windows_onnx_common import require_directml_session
 
 
+def _numpy_dtype_from_onnx_type(type_name: str):
+    if type_name == "tensor(float16)":
+        return np.float16
+    if type_name == "tensor(float)":
+        return np.float32
+    raise RuntimeError(f"不支持的 ONNX 输入类型: {type_name}")
+
+
 class WindowsRvmOnnxWorker(QThread):
     progress = Signal(int, int)
     stage_changed = Signal(str)
@@ -56,7 +64,6 @@ class WindowsRvmOnnxWorker(QThread):
 
     def _do_segment(self) -> None:
         from src.rvm_matting import (
-            LANCZOS,
             MattingCancelled,
             auto_downsample_ratio,
             compute_output_size,
@@ -100,14 +107,21 @@ class WindowsRvmOnnxWorker(QThread):
 
         self.stage_changed.emit(f"正在加载 RVM ONNX 模型 {self._variant}（DirectML）…")
         session = require_directml_session(model_path)
+        input_info = {item.name: item for item in session.get_inputs()}
+        src_dtype = _numpy_dtype_from_onnx_type(input_info["src"].type)
+        rec_dtypes = [
+            _numpy_dtype_from_onnx_type(input_info[name].type)
+            for name in ("r1i", "r2i", "r3i", "r4i")
+        ]
+        dsr_dtype = _numpy_dtype_from_onnx_type(input_info["downsample_ratio"].type)
 
         if is_cancelled():
             raise MattingCancelled("Cancelled after model load.")
 
         self.stage_changed.emit(f"正在使用 DirectML 处理 {frame_count} 帧…")
 
-        rec = [np.zeros((1, 1, 1, 1), dtype=np.float32) for _ in range(4)]
-        dsr = np.asarray([downsample_ratio], dtype=np.float32)
+        rec = [np.zeros((1, 1, 1, 1), dtype=dtype) for dtype in rec_dtypes]
+        dsr = np.asarray([downsample_ratio], dtype=dsr_dtype)
         processed = 0
 
         for index, frame_np in enumerate(
@@ -116,21 +130,20 @@ class WindowsRvmOnnxWorker(QThread):
                 self._request.video_path,
                 source_width,
                 source_height,
+                output_width=output_width,
+                output_height=output_height,
             ),
             start=1,
         ):
             if is_cancelled():
                 raise MattingCancelled("Cancelled while processing frames.")
 
-            image = Image.fromarray(frame_np)
-            if (output_width, output_height) != (source_width, source_height):
-                image = image.resize((output_width, output_height), LANCZOS)
-
-            src = np.asarray(image, dtype=np.float32).transpose(2, 0, 1)[None] / 255.0
+            src = frame_np.astype(src_dtype, copy=False).transpose(2, 0, 1)[None]
+            src /= np.asarray(255.0, dtype=src_dtype)
             fgr, pha, *rec = session.run(
                 [],
                 {
-                    "src": src.astype(np.float32, copy=False),
+                    "src": src.astype(src_dtype, copy=False),
                     "r1i": rec[0],
                     "r2i": rec[1],
                     "r3i": rec[2],
@@ -147,6 +160,7 @@ class WindowsRvmOnnxWorker(QThread):
             Image.fromarray(rgba, "RGBA").save(
                 self._request.dancer_dir / f"frame_{index:04d}.png",
                 "PNG",
+                compress_level=1,
             )
 
             processed = index

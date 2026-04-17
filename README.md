@@ -47,6 +47,43 @@ uv pip install --python .venv/bin/python -r requirements.txt \
   --extra-index-url https://download.pytorch.org/whl/cpu
 ```
 
+## 模型准备
+
+仓库默认**不再提交 ONNX 模型文件**。Windows 下使用 ONNX Runtime DirectML 抠图前，先执行：
+
+```powershell
+.\tools\fetch-models.cmd
+```
+
+脚本会自动下载并放到正确位置：
+
+- `models/rvm/rvm_mobilenetv3_fp16.onnx`
+- `models/rvm/rvm_mobilenetv3_fp32.onnx`
+- `models/u2net/u2net_human_seg.onnx`
+
+只下载单个模型：
+
+```powershell
+.\tools\fetch-models.cmd -Only rvm-fp16
+.\tools\fetch-models.cmd -Only u2net-human-seg
+```
+
+强制重下：
+
+```powershell
+.\tools\fetch-models.cmd -Force
+```
+
+## Model Setup
+
+The repository no longer stores ONNX model binaries. Before using the Windows ONNX Runtime DirectML pipeline, run:
+
+```powershell
+.\tools\fetch-models.cmd
+```
+
+The script downloads the models into their expected locations under `models/`.
+
 ## 目录结构
 
 ```
@@ -91,7 +128,7 @@ desktop-dancer/
 .venv/bin/python remove_bg.py --input 你的视频.mp4 --frames-dir dancer/角色名
 ```
 
-首次运行会自动下载 U2Net 模型（约 176MB）。441 帧视频在 CPU 上约需 3~5 分钟。
+Linux 旧链路首次运行时仍会自动下载 U2Net 模型（约 176MB）。如果你在 Windows 上使用 ONNX Runtime DirectML，请先运行 `.\tools\fetch-models.cmd`。
 
 抠图完成后，建议先预览一帧确认效果：
 
@@ -122,7 +159,7 @@ eog dancer/角色名/frame_0001.png
 .venv/bin/python remove_bg.py --input your_video.mp4 --frames-dir dancer/character_name
 ```
 
-On first run, the U2Net model (~176MB) is downloaded automatically. A 441-frame video takes roughly 3–5 minutes on CPU.
+The legacy Linux path still auto-downloads the U2Net model (~176MB) on first run. On Windows, download the ONNX models first with `.\tools\fetch-models.cmd`.
 
 After processing, preview a frame to verify the result:
 
@@ -177,7 +214,6 @@ Common options:
 ![screenshot 1](screenshot/dd1.png)
 ![screenshot 2](screenshot/dd2.png)
 ![screenshot 3](screenshot/dd3.png)
-
 
 
 

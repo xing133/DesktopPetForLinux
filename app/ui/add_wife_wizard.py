@@ -20,6 +20,7 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QProgressBar,
     QPushButton,
+    QSpinBox,
     QStackedWidget,
     QVBoxLayout,
     QWidget,
@@ -326,6 +327,13 @@ class AddWifeWizard(QWidget):
         self._name_edit.setMinimumHeight(36)
         self._name_edit.textChanged.connect(self._on_naming_input_changed)
 
+        self._display_height_spin = QSpinBox()
+        self._display_height_spin.setRange(64, 2160)
+        self._display_height_spin.setValue(450)
+        self._display_height_spin.setSingleStep(10)
+        self._display_height_spin.setSuffix(" px")
+        self._display_height_spin.setMinimumHeight(36)
+
         self._engine_combo = QComboBox()
         self._engine_combo.setMinimumHeight(36)
         for spec in self._matting_engines:
@@ -358,6 +366,8 @@ class AddWifeWizard(QWidget):
         layout.addWidget(hint)
         layout.addSpacing(12)
         layout.addWidget(self._name_edit)
+        layout.addWidget(QLabel("display-height"))
+        layout.addWidget(self._display_height_spin)
         if self._is_windows:
             layout.addWidget(QLabel("抠图引擎"))
             layout.addWidget(self._engine_combo)
@@ -571,6 +581,10 @@ class AddWifeWizard(QWidget):
 
         candidates.sort(key=lambda p: p.stat().st_mtime, reverse=True)
         self._pending_input_video = candidates[0]
+        if self._pending_input_video.suffix.lower() == ".mp4":
+            self._show_preview(self._pending_input_video)
+            return
+
         self._start_transcode(self._pending_input_video, self._job_id)
 
     # ------------------------------------------------------------------
@@ -747,7 +761,7 @@ class AddWifeWizard(QWidget):
             project_root=self._project_root,
             video_path=video_path,
             dancer_dir=dancer_dir,
-            display_height=450,
+            display_height=self._display_height_spin.value(),
         )
         try:
             self._segment_worker = create_segment_worker(engine_id, request)

@@ -9,6 +9,7 @@ wheels/
 # Virtual environments
 .venv
 
+# External model assets
+models/**/*.onnx
 
 dancer
-
